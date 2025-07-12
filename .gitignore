@@ -179,3 +179,15 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
+
+# Ignore contents of input/ but keep the folder
+input/*
+
+# Ignore contents of separated/ but keep the folder
+separated/*
+
+# Ignore log file
+audio_processing.log
+
+# Ignore system logs or crash reports
+*.log
