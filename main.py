@@ -1,18 +1,26 @@
-from fastapi import FastAPI, BackgroundTasks, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, BackgroundTasks, HTTPException
+from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.concurrency import run_in_threadpool
 from enum import Enum
 from pathlib import Path
-import shutil, subprocess, os, uuid, asyncio, threading, zipfile, soundfile as sf, logging, yt_dlp
-import traceback, base64
+import shutil, subprocess, os, uuid, zipfile, soundfile as sf, logging, yt_dlp
+import requests, re
 from pydantic import BaseModel
+import boto3
+from botocore.exceptions import ClientError, NoCredentialsError
+from urllib.parse import urlparse, unquote_plus
+from typing import Dict
+from dotenv import load_dotenv
+from functools import partial
+
+load_dotenv()
 
 app = FastAPI(title="Demucs Audio Processor", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # TODO: Restrict in production
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -21,395 +29,152 @@ app.add_middleware(
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-active_downloads = {}
+class UploadType(str, Enum):
+    youtubeURL = "youtubeURL"
+    audio = "audio"
+    video = "video"
 
 class Mode(str, Enum):
     two = "two"
     four = "four"
 
-class RunPodInput(BaseModel):
-    file_base64: str
-    filename: str
-    mode: str = "two"
-
-class RunPodRequest(BaseModel):
-    input: RunPodInput
-    
-class ExtractAudioInput(BaseModel):
-    file_base64: str
-    filename: str
-    
-class YouTubeInput(BaseModel):
+class ProcessAudioInput(BaseModel):
+    upload_type: UploadType
     url: str
+    mode: Mode = Mode.two
+    filename: str = None
 
-def cleanup_files(paths: list[Path], dirs: list[Path] = []):
-    for path in paths:
-        try:
-            if path.exists():
-                path.unlink()
-                logger.info(f"Deleted file: {path}")
-        except Exception as e:
-            logger.warning(f"Failed to delete file {path}: {e}")
-            logger.debug(traceback.format_exc())
+def slugify(name: str) -> str:
+    return re.sub(r'[^a-z0-9]+', '-', name.lower()).strip('-')
 
-    for directory in dirs:
-        try:
-            if directory.exists() and directory.is_dir():
-                logger.info(f"Attempting to delete directory: {directory}")
-                shutil.rmtree(directory)
-                logger.info(f"Deleted directory: {directory}")
-        except Exception as e:
-            logger.warning(f"Failed to delete directory {directory}: {e}")
-            logger.debug(traceback.format_exc())
-            
-@app.post("/extract_audio")
-async def extract_audio(input: ExtractAudioInput):
-    try:
-        file_data = base64.b64decode(input.file_base64)
-        filename = input.filename
-        ext = Path(filename).suffix.lower()
+def is_s3_url(url: str) -> bool:
+    parsed = urlparse(url)
+    return (
+        parsed.netloc.endswith('.amazonaws.com') or
+        parsed.netloc.endswith('.s3.amazonaws.com') or
+        's3' in parsed.netloc
+    )
 
-        allowed_exts = {".mp4", ".mov", ".mkv", ".avi"}
-        if ext not in allowed_exts:
-            raise HTTPException(status_code=400, detail="Unsupported video format.")
+def extract_filename_from_url(url: str) -> str:
+    parsed = urlparse(url)
+    filename = os.path.basename(parsed.path)
+    return unquote_plus(filename) if '.' in filename else "audio_file"
 
-        temp_id = uuid.uuid4().hex
-        input_path = Path("input") / f"{temp_id}_{filename}"
-        output_path = input_path.with_suffix(".mp3")
-
-        with open(input_path, "wb") as f:
-            f.write(file_data)
-
-        subprocess.run([
-            "ffmpeg", "-y", "-i", str(input_path),
-            "-vn", "-ar", "44100", "-ac", "2", "-b:a", "192k",
-            str(output_path)
-        ], check=True)
-
-        encoded_audio = base64.b64encode(output_path.read_bytes()).decode("utf-8")
-
-        cleanup_files(paths=[input_path, output_path])
-
-        return JSONResponse(content={
-            "audio_base64": encoded_audio,
-            "filename": output_path.name,
-            "message": "Audio successfully extracted from video"
-        })
-
-    except subprocess.CalledProcessError as e:
-        raise HTTPException(status_code=500, detail=f"FFmpeg failed: {e.stderr}")
-    except Exception as e:
-        logger.error(traceback.format_exc())
-        raise HTTPException(status_code=500, detail=str(e))
-    
-from fastapi.concurrency import run_in_threadpool
-
-@app.post("/youtube_audio")
-async def download_youtube(input: YouTubeInput, request: Request):
-    try:
-        temp_id = uuid.uuid4().hex
-        temp_dir = Path("input")
-        temp_dir.mkdir(exist_ok=True)
-        output_template = temp_dir / f"{temp_id}.%(ext)s"
-        
-        cancellation_event = threading.Event()
-        active_downloads[temp_id] = cancellation_event
-        
-        if await request.is_disconnected():
-            logger.info("Client disconnected before download started")
-            raise HTTPException(status_code=499, detail="Client disconnected")
-
-        def progress_hook(d):
-            if cancellation_event.is_set():
-                logger.info(f"Download {temp_id} cancelled via progress hook")
-                raise yt_dlp.utils.DownloadError("Download cancelled")
-            
-            if d['status'] == 'downloading':
-                logger.info(f"Download progress: {d.get('_percent_str', 'N/A')}")
-            elif d['status'] == 'finished':
-                logger.info(f"Download finished: {d['filename']}")
-            elif d['status'] == 'error':
-                logger.error(f"Download error: {d.get('error', 'Unknown error')}")
-
-        ydl_opts = {
-            "format": "bestaudio/best",
-            "outtmpl": str(output_template),
-            "quiet": False,  
-            "no_warnings": False,
-            "progress_hooks": [progress_hook],
-            "postprocessors": [{
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": "mp3",
-                "preferredquality": "192"
-            }],
-            "socket_timeout": 30,
-            "retries": 1,
-            "fragment_retries": 1,
-            "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "postprocessor_args": [
-                "-threads", "1",  
-                "-y",  
-                "-loglevel", "error",  
-                "-nostdin" 
-            ],
-            "ignoreerrors": False,
-            "abort_on_unavailable_fragment": True,
-        }
-
-        def _download_youtube():
-            try:
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    if cancellation_event.is_set():
-                        logger.info(f"Download {temp_id} cancelled before start")
-                        raise yt_dlp.utils.DownloadError("Download cancelled")
-                    
-                    info = ydl.extract_info(input.url, download=False)
-                    logger.info(f"Video: {info.get('title', 'Unknown')} - Duration: {info.get('duration', 'Unknown')}s")
-                    
-                    if cancellation_event.is_set():
-                        logger.info(f"Download {temp_id} cancelled after info extraction")
-                        raise yt_dlp.utils.DownloadError("Download cancelled")
-                    
-                    ydl.download([input.url])
-                    
-                    if cancellation_event.is_set():
-                        logger.info(f"Download {temp_id} cancelled after download")
-                        raise yt_dlp.utils.DownloadError("Download cancelled")
-                        
-            except yt_dlp.utils.DownloadError as e:
-                if "cancelled" in str(e).lower():
-                    logger.info(f"Download {temp_id} cancelled: {e}")
-                    raise
-                else:
-                    logger.error(f"yt-dlp error: {e}")
-                    raise
-            except Exception as e:
-                logger.error(f"Download error: {e}")
-                raise
-
-        async def monitor_client_disconnection():
-            while True:
-                if await request.is_disconnected():
-                    logger.info(f"Client disconnected for download {temp_id}")
-                    cancellation_event.set()
-                    return
-                await asyncio.sleep(1)  
-
-        download_task = asyncio.create_task(
-            asyncio.wait_for(
-                run_in_threadpool(_download_youtube), 
-                timeout=300  
-            )
+async def download_file(url: str, dest: Path):
+    if is_s3_url(url):
+        s3 = boto3.client(
+            's3',
+            aws_access_key_id=os.getenv('AWS_ACCESS_KEY_ID'),
+            aws_secret_access_key=os.getenv('AWS_SECRET_ACCESS_KEY'),
+            region_name=os.getenv('AWS_REGION')
         )
-        
-        monitor_task = asyncio.create_task(monitor_client_disconnection())
-        
-        try:
-            done, pending = await asyncio.wait(
-                [download_task, monitor_task],
-                return_when=asyncio.FIRST_COMPLETED
-            )
-            
-            for task in pending:
-                task.cancel()
-            
-            if cancellation_event.is_set():
-                logger.info(f"Download {temp_id} was cancelled")
-                raise HTTPException(status_code=499, detail="Download cancelled")
-            
-            if download_task in done:
-                await download_task  
-            else:
-                cancellation_event.set()
-                raise HTTPException(status_code=499, detail="Client disconnected")
-                
-        except asyncio.TimeoutError:
-            logger.error(f"Download {temp_id} timed out")
-            cancellation_event.set()
-            raise HTTPException(status_code=504, detail="Download timeout")
-        except asyncio.CancelledError:
-            logger.info(f"Download {temp_id} was cancelled")
-            cancellation_event.set()
-            raise HTTPException(status_code=499, detail="Download cancelled")
+        bucket = os.getenv("S3_BUCKET_NAME")
+        key = unquote_plus(urlparse(url).path.lstrip("/"))
+        await run_in_threadpool(s3.download_file, bucket, key, str(dest))
+    else:
+        r = await run_in_threadpool(partial(requests.get, url, stream=True, timeout=300))
+        with open(dest, 'wb') as f:
+            for chunk in r.iter_content(chunk_size=8192):
+                f.write(chunk)
 
-        mp3_files = list(temp_dir.glob(f"{temp_id}*.mp3"))
-        if not mp3_files:
-            audio_files = (
-                list(temp_dir.glob(f"{temp_id}*.webm")) +
-                list(temp_dir.glob(f"{temp_id}*.m4a")) +
-                list(temp_dir.glob(f"{temp_id}*.wav")) +
-                list(temp_dir.glob(f"{temp_id}*.aac"))
-            )
-            
-            if audio_files:
-                logger.info(f"No MP3 found, but found audio file: {audio_files[0]}")
-                output_file = audio_files[0]
-            else:
-                logger.error(f"No audio files found for download {temp_id}")
-                all_files = list(temp_dir.glob(f"{temp_id}*"))
-                logger.info(f"All files found: {[f.name for f in all_files]}")
-                raise HTTPException(status_code=500, detail="No audio file found after download")
-        else:
-            output_file = mp3_files[0]
+async def download_youtube_audio(url: str, temp_id: str) -> Path:
+    output = Path("/tmp") / f"{temp_id}.%(ext)s"
+    ydl_opts = {
+        "format": "bestaudio/best",
+        "outtmpl": str(output),
+        "quiet": True,
+        "postprocessors": [{
+            "key": "FFmpegExtractAudio",
+            "preferredcodec": "mp3",
+            "preferredquality": "192"
+        }]
+    }
+    def _download():
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([url])
+    await run_in_threadpool(_download)
+    mp3_path = list(Path("/tmp").glob(f"{temp_id}*.mp3"))
+    return mp3_path[0] if mp3_path else None
 
-        if not output_file.exists():
-            logger.error(f"Output file {output_file} does not exist")
-            raise HTTPException(status_code=500, detail="Output file was not created")
-            
-        file_size = output_file.stat().st_size
-        if file_size == 0:
-            logger.error(f"Output file {output_file} is empty")
-            raise HTTPException(status_code=500, detail="Output file is empty")
+async def extract_audio(video: Path, temp_id: str) -> Path:
+    out_path = Path("/tmp") / f"{temp_id}_extracted.mp3"
+    await run_in_threadpool(partial(subprocess.run, [
+        "ffmpeg", "-y", "-i", str(video), "-vn", "-ar", "44100", "-ac", "2", "-b:a", "192k", str(out_path)
+    ], check=True))
+    return out_path
 
-        logger.info(f"Using output file: {output_file} (size: {file_size} bytes)")
+async def run_demucs(audio_path: Path, mode: Mode, temp_id: str) -> Dict[str, Path]:
+    output_dir = Path("/tmp/separated")
+    cmd = ["python", "-m", "demucs", str(audio_path), "--out", str(output_dir)]
+    if mode == Mode.two:
+        cmd.insert(3, "--two-stems=vocals")
+    await run_in_threadpool(partial(subprocess.run, cmd, check=True, capture_output=True))
 
-        encoded_audio = base64.b64encode(output_file.read_bytes()).decode("utf-8")
-        
-        cleanup_files(paths=[output_file])
+    stem_dir = output_dir / "htdemucs" / audio_path.stem
+    stems = {
+        "vocals.wav": "vocals.mp3",
+        "no_vocals.wav": "background.mp3"
+    } if mode == Mode.two else {
+        "vocals.wav": "vocals.mp3",
+        "drums.wav": "drums.mp3",
+        "bass.wav": "bass.mp3",
+        "other.wav": "other.mp3"
+    }
 
-        return JSONResponse(content={
-            "audio_base64": encoded_audio,
-            "filename": output_file.name,
-            "file_size": file_size,
-            "message": "YouTube audio successfully downloaded"
-        })
+    output = {}
+    for wav, mp3 in stems.items():
+        src = stem_dir / wav
+        dst = stem_dir / mp3
+        if src.exists():
+            await run_in_threadpool(partial(subprocess.run, [
+                "ffmpeg", "-y", "-i", str(src), "-codec:a", "libmp3lame", "-qscale:a", "5", str(dst)
+            ], check=True))
+            output[mp3.replace('.mp3', '')] = dst
+    return output
 
-    except HTTPException:
-        raise
-    except yt_dlp.utils.DownloadError as e:
-        if "cancelled" in str(e).lower():
-            logger.info(f"Download cancelled: {e}")
-            raise HTTPException(status_code=499, detail="Download cancelled")
-        else:
-            logger.error(f"yt-dlp download error: {e}")
-            clean_error = str(e).replace('\x1b[0;31m', '').replace('\x1b[0m', '').replace('ERROR:', '').strip()
-            raise HTTPException(status_code=400, detail=f"Download failed: {clean_error}")
-    except Exception as e:
-        logger.error(f"Unexpected error: {traceback.format_exc()}")
-        raise HTTPException(status_code=500, detail=f"YouTube download failed: {str(e)}")
-    
-    finally:
-        try:
-            files_to_clean = list(temp_dir.glob(f"{temp_id}*"))
-            for file_path in files_to_clean:
-                try:
-                    if file_path.exists():
-                        file_path.unlink()
-                        logger.info(f"Cleaned up: {file_path}")
-                except Exception as e:
-                    logger.error(f"Error cleaning up {file_path}: {e}")
-        except Exception as e:
-            logger.error(f"Error during cleanup: {e}")
-        
-        if temp_id in active_downloads:
-            del active_downloads[temp_id]
-
-@app.delete("/youtube_audio/cancel_all")
-async def cancel_all_downloads():
-    """Cancel all active downloads"""
-    cancelled_count = 0
-    for temp_id, cancellation_event in active_downloads.items():
-        if not cancellation_event.is_set():
-            cancellation_event.set()
-            cancelled_count += 1
-    
-    return JSONResponse(content={
-        "message": f"Cancelled {cancelled_count} active downloads"
-    })
-
+def zip_stems(stems: Dict[str, Path], filename: str) -> Path:
+    zip_path = Path("/tmp") / filename
+    with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as z:
+        for name, path in stems.items():
+            z.write(path, f"{name}.mp3")
+    return zip_path
 
 @app.post("/process_audio")
-async def runpod_handler(request: RunPodRequest):
+async def process(input_data: ProcessAudioInput):
+    temp_id = uuid.uuid4().hex
+    Path("/tmp").mkdir(parents=True, exist_ok=True)
+
     try:
-        input_data = request.input
-        
-        file_data = base64.b64decode(input_data.file_base64)
-        filename = input_data.filename
-        mode = input_data.mode
-        
-        allowed_exts = {".mp3", ".wav", ".flac", ".m4a", ".aac"}
-        ext = Path(filename).suffix.lower()
-        if ext not in allowed_exts:
-            raise HTTPException(status_code=400, detail="Invalid file type. Supported formats: mp3, wav, flac, m4a, aac")
-        
-        track_id = f"{uuid.uuid4()}_{filename}"
-        input_dir = Path("input")
-        output_dir = Path("separated")
-        input_dir.mkdir(exist_ok=True)
-        output_dir.mkdir(exist_ok=True)
-        
-        input_path = input_dir / track_id
-        
-        with open(input_path, "wb") as f:
-            f.write(file_data)
-        logger.info(f"Saved file to {input_path}")
-
-        if mode == "two":
-            demucs_command = [
-                "python", "-m", "demucs",
-                "--two-stems=vocals",
-                str(input_path),
-                "--out=separated"
-            ]
+        if input_data.upload_type == UploadType.youtubeURL:
+            audio = await download_youtube_audio(input_data.url, temp_id)
+        elif input_data.upload_type == UploadType.audio:
+            audio = Path("/tmp") / f"{temp_id}_{extract_filename_from_url(input_data.url)}"
+            await download_file(input_data.url, audio)
+        elif input_data.upload_type == UploadType.video:
+            video = Path("/tmp") / f"{temp_id}_{extract_filename_from_url(input_data.url)}"
+            await download_file(input_data.url, video)
+            audio = await extract_audio(video, temp_id)
         else:
-            demucs_command = [
-                "python", "-m", "demucs",
-                str(input_path),
-                "--out=separated"
-            ]
-            
-        try:
-            result = subprocess.run(demucs_command, check=True, capture_output=True, text=True)
-            logger.info(f"Demucs output: {result.stdout}")
-        except subprocess.CalledProcessError as e:
-            logger.error(f"Demucs failed: {e.stderr}")
-            raise HTTPException(status_code=500, detail=f"Stem separation failed: {e.stderr}")
+            raise HTTPException(status_code=400, detail="Invalid upload type")
 
-        track_name = input_path.stem
-        stem_folder = Path("separated") / "htdemucs" / track_name
-        
-        stems = {
-            "vocals.wav": "vocals.mp3",
-            "no_vocals.wav": "background.mp3"
-        } if mode == "two" else {
-            "vocals.wav": "vocals.mp3",
-            "drums.wav": "drums.mp3",
-            "bass.wav": "bass.mp3",
-            "other.wav": "other.mp3"
-        }
-        
-        output_files = {}
-        
-        for wav_file, mp3_file in stems.items():
-            wav_path = stem_folder / wav_file
-            mp3_path = stem_folder / mp3_file
-            if wav_path.exists():
-                try:
-                    subprocess.run([
-                        "ffmpeg", "-y", "-i", str(wav_path),
-                        "-codec:a", "libmp3lame", "-qscale:a", "5",
-                        str(mp3_path)
-                    ], check=True, capture_output=True)
-                    
-                    with open(mp3_path, "rb") as f:
-                        mp3_data = f.read()
-                        output_files[mp3_file] = base64.b64encode(mp3_data).decode('utf-8')
-                        
-                except subprocess.CalledProcessError as e:
-                    logger.error(f"FFmpeg failed for {wav_file}: {e.stderr.decode()}")
-                    continue
-        
-        cleanup_files(
-            paths=[input_path, *[stem_folder / mp3_file for mp3_file in stems.values()]],
-            dirs=[stem_folder]
+        stems = await run_demucs(audio, input_data.mode, temp_id)
+
+        slug_name = slugify((input_data.filename or extract_filename_from_url(input_data.url)).rsplit('.', 1)[0])
+        mode_label = "2stem" if input_data.mode == Mode.two else "4stem"
+        zip_filename = f"{slug_name}-{mode_label}-{temp_id[:8]}.zip"
+
+        zip_path = zip_stems(stems, zip_filename)
+
+        return FileResponse(
+            path=str(zip_path),
+            media_type="application/zip",
+            filename=zip_filename
         )
-        
-        return JSONResponse(content={
-            "output": output_files,
-            "message": f"Successfully separated {len(output_files)} stems"
-        })
-        
+
     except Exception as e:
-        logger.error(f"Error processing request: {str(e)}")
-        logger.error(traceback.format_exc())
+        logger.error(f"Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}

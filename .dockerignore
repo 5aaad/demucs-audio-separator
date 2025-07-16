@@ -1,9 +1,9 @@
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
+*.py[cod]
 *.log
 *.zip
 temp/
 input/
 separated/
+.env
+.env.*
