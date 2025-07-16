@@ -1,6 +1,9 @@
 __pycache__/
 *.pyc
 *.pyo
+*.pyd
 *.log
-separated/
+*.zip
+temp/
 input/
+separated/

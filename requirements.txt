@@ -5,3 +5,4 @@ demucs==4.0.0
 ffmpeg-python==0.2.0
 soundfile==0.12.1
 python-multipart==0.0.6
+yt-dlp==2024.5.27
