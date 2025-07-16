@@ -1,9 +1,31 @@
+# Byte-compiled / cache
 __pycache__/
 *.py[cod]
 *.log
+
+# Audio/video artifacts
 *.zip
+*.mp3
+*.wav
+*.mp4
+
+# Temp directories
 temp/
 input/
 separated/
+
+# Env files
 .env
 .env.*
+
+# IDE/editor config
+.vscode/
+.idea/
+
+# Git & metadata
+.git/
+.gitignore
+
+# OS files
+.DS_Store
+Thumbs.db
