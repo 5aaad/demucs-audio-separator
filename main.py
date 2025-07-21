@@ -13,14 +13,7 @@ from urllib.parse import urlparse, unquote_plus
 from typing import Dict, Optional
 from dotenv import load_dotenv
 from functools import partial
-import asyncio
 
-# Import the Docker-optimized YouTube downloader
-from docker_youtube_downloader import (
-    download_youtube_audio, 
-    startup_docker_youtube, 
-    docker_health_check
-)
 
 load_dotenv()
 
@@ -34,19 +27,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Enhanced logging configuration
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
-
-# Check if running in Docker
-IS_DOCKER = os.path.exists('/.dockerenv')
-if IS_DOCKER:
-    logger.info("Running in Docker environment")
-else:
-    logger.info("Running in local environment")
 
 class UploadType(str, Enum):
     youtubeURL = "youtubeURL"
@@ -93,7 +78,6 @@ async def download_file(url: str, dest: Path):
         key = unquote_plus(urlparse(url).path.lstrip("/"))
         await run_in_threadpool(s3.download_file, bucket, key, str(dest))
     else:
-        # Enhanced download with better error handling
         try:
             headers = {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
@@ -183,7 +167,6 @@ async def cleanup_temp_files(temp_id: str):
     try:
         temp_dir = Path("/tmp")
         
-        # Clean up files with temp_id
         for file in temp_dir.glob(f"{temp_id}*"):
             if file.is_file():
                 try:
@@ -191,7 +174,6 @@ async def cleanup_temp_files(temp_id: str):
                 except Exception as e:
                     logger.warning(f"Failed to delete {file}: {e}")
         
-        # Clean up separated directory
         separated_dir = temp_dir / "separated"
         if separated_dir.exists():
             try:
@@ -201,17 +183,40 @@ async def cleanup_temp_files(temp_id: str):
                 
     except Exception as e:
         logger.warning(f"Failed to cleanup temp files: {e}")
+        
+def extract_video_id(youtube_url: str) -> str:
+    match = re.search(r"(?:v=|youtu\.be/)([a-zA-Z0-9_-]{11})", youtube_url)
+    if not match:
+        raise HTTPException(status_code=400, detail="Invalid YouTube URL")
+    return match.group(1)
 
-@app.on_event("startup")
-async def startup_event():
-    """Initialize Docker environment on startup"""
-    if IS_DOCKER:
-        logger.info("Initializing Docker environment for YouTube downloads...")
-        health = await startup_docker_youtube()
-        logger.info(f"Docker YouTube initialization result: {health}")
+async def fetch_audio_from_rapidapi(video_id: str, temp_id: str) -> Path:
+    try:
+        url = f"https://youtube-mp3-audio-video-downloader.p.rapidapi.com/download-mp3/{video_id}"
+        querystring = {"quality": "low"}
+
+        headers = {
+            "x-rapidapi-key": os.getenv("RAPIDAPI_KEY"),
+            "x-rapidapi-host": "youtube-mp3-audio-video-downloader.p.rapidapi.com"
+        }
+
+        response = await run_in_threadpool(lambda: requests.get(url, headers=headers, params=querystring, stream=True))
+        response.raise_for_status()
+        logger.info(f"Content-Type: {response.headers.get('Content-Type')}")
+
+        audio_path = Path("/tmp") / f"{temp_id}_yt_audio.mp3"
+        with open(audio_path, 'wb') as f:
+            for chunk in response.iter_content(chunk_size=8192):
+                f.write(chunk)
+
+        return audio_path
+
+    except requests.exceptions.RequestException as e:
+        raise HTTPException(status_code=500, detail=f"RapidAPI error: {e}")
 
 @app.post("/process_audio")
 async def process(input_data: ProcessAudioInput, background_tasks: BackgroundTasks):
+    start = time.time()    
     temp_id = uuid.uuid4().hex
     Path("/tmp").mkdir(parents=True, exist_ok=True)
     
@@ -224,10 +229,9 @@ async def process(input_data: ProcessAudioInput, background_tasks: BackgroundTas
         print("filename:", input_data.filename)
         
         if input_data.upload_type == UploadType.youtubeURL:
-            logger.info(f"Downloading YouTube audio: {input_data.url}")
-            audio = await download_youtube_audio(input_data.url, temp_id)
-            if not audio:
-                raise HTTPException(status_code=500, detail="Failed to download YouTube audio")
+            logger.info(f"Fetching YouTube audio from RapidAPI: {input_data.url}")
+            video_id = extract_video_id(input_data.url)
+            audio = await fetch_audio_from_rapidapi(video_id, temp_id)
                 
         elif input_data.upload_type == UploadType.audio:
             audio = Path("/tmp") / f"{temp_id}_{extract_filename_from_url(input_data.url)}"
@@ -237,6 +241,7 @@ async def process(input_data: ProcessAudioInput, background_tasks: BackgroundTas
             video = Path("/tmp") / f"{temp_id}_{extract_filename_from_url(input_data.url)}"
             await download_file(input_data.url, video)
             audio = await extract_audio(video, temp_id)
+
             
         else:
             raise HTTPException(status_code=400, detail="Invalid upload type")
@@ -262,6 +267,10 @@ async def process(input_data: ProcessAudioInput, background_tasks: BackgroundTas
 
         # Schedule cleanup of temporary files
         background_tasks.add_task(cleanup_temp_files, temp_id)
+        logger.info(f"[{temp_id}] Downloaded in {time.time() - start:.2f}s")
+        logger.info(f"[{temp_id}] Demucs finished in {time.time() - start:.2f}s")
+
+        
 
         logger.info(f"Successfully processed audio: {zip_filename}")
         return FileResponse(
@@ -279,57 +288,7 @@ async def process(input_data: ProcessAudioInput, background_tasks: BackgroundTas
         await cleanup_temp_files(temp_id)
         raise HTTPException(status_code=500, detail=str(e))
 
+        
 @app.get("/health")
-async def health():
-    """Enhanced health check"""
-    try:
-        basic_health = {"status": "ok", "docker": IS_DOCKER}
-        
-        if IS_DOCKER:
-            youtube_health = await docker_health_check()
-            basic_health.update(youtube_health)
-            
-        return basic_health
-    except Exception as e:
-        return {"status": "error", "error": str(e)}
-
-@app.post("/test_youtube_url")
-async def test_youtube_url(url: str):
-    """Test if a YouTube URL can be downloaded"""
-    try:
-        temp_id = uuid.uuid4().hex
-        ydl_opts = {
-            "quiet": True,
-            "no_warnings": True,
-            "socket_timeout": 10,
-        }
-        
-        def _test():
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=False)
-                return {
-                    "title": info.get("title", "Unknown"),
-                    "duration": info.get("duration", 0),
-                    "available": True
-                }
-        
-        result = await run_in_threadpool(_test)
-        return result
-    except Exception as e:
-        return {
-            "available": False,
-            "error": str(e)
-        }
-
-@app.get("/debug/docker")
-async def debug_docker():
-    """Debug endpoint for Docker environment"""
-    return {
-        "is_docker": IS_DOCKER,
-        "tmp_dir_exists": Path("/tmp").exists(),
-        "tmp_dir_writable": os.access("/tmp", os.W_OK),
-        "environment_vars": {
-            "YT_DLP_CACHE_DIR": os.getenv("YT_DLP_CACHE_DIR"),
-            "TMPDIR": os.getenv("TMPDIR"),
-        }
-    }
+def health():
+    return {"status": "ok"}
